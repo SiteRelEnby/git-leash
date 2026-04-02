@@ -1,0 +1,889 @@
+#!/usr/bin/env bash
+# git-leash — helps you stay focused on what you're supposed to be doing.
+#             by a puppygirl 🐾
+#
+# A pre-commit hook that blocks commits during configured focus windows,
+# with optional puppygirl-flavored bark messages.
+
+set -euo pipefail
+
+LEASH_VERSION="0.1.0"
+
+# --- Config Parser -----------------------------------------------------------
+# Parses INI-style config with named sections and multi-value keys.
+# Supports: [schedule "name"], [task], [override], [messages]
+
+# Parse a config file into a flat key-value store.
+# Section headers become prefixes: schedule.work-focus.start=09:00
+# Multi-value keys (allow, block) get numbered: schedule.work-focus.allow.0=remote:foo
+declare -A CONFIG
+declare -a SCHEDULE_NAMES=()
+
+parse_config_file() {
+    local file="$1"
+    local current_section=""
+    local current_name=""
+    local prefix=""
+    declare -A multicount
+
+    [[ -f "$file" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # strip comments and trailing whitespace
+        line="${line%%#*}"
+        line="${line%"${line##*[![:space:]]}"}"
+        # skip blank lines
+        [[ -z "$line" ]] && continue
+
+        # named section: [schedule "work-focus"]
+        if [[ "$line" =~ ^\[([a-zA-Z_-]+)\ +\"([^\"]+)\"\]$ ]]; then
+            current_section="${BASH_REMATCH[1]}"
+            current_name="${BASH_REMATCH[2]}"
+            prefix="${current_section}.${current_name}."
+            if [[ "$current_section" == "schedule" ]]; then
+                # track schedule names (avoid duplicates on merge)
+                local found=0
+                for sn in "${SCHEDULE_NAMES[@]:-}"; do
+                    [[ "$sn" == "$current_name" ]] && found=1 && break
+                done
+                [[ $found -eq 0 ]] && SCHEDULE_NAMES+=("$current_name")
+            fi
+            continue
+        fi
+
+        # plain section: [task], [override], [messages]
+        if [[ "$line" =~ ^\[([a-zA-Z_-]+)\]$ ]]; then
+            current_section="${BASH_REMATCH[1]}"
+            current_name=""
+            prefix="${current_section}."
+            continue
+        fi
+
+        # key=value
+        if [[ "$line" =~ ^([a-zA-Z_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            # trim leading/trailing whitespace from value
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+
+            # multi-value keys: allow, block
+            if [[ "$key" == "allow" || "$key" == "block" ]]; then
+                local count_key="${prefix}${key}._count"
+                local count="${multicount[$count_key]:-${CONFIG[$count_key]:-0}}"
+                CONFIG["${prefix}${key}.${count}"]="$value"
+                count=$((count + 1))
+                CONFIG["$count_key"]="$count"
+                multicount["$count_key"]="$count"
+            else
+                CONFIG["${prefix}${key}"]="$value"
+            fi
+        fi
+    done < "$file"
+}
+
+# Get a config value with optional default
+cfg() {
+    local key="$1"
+    local default="${2:-}"
+    echo "${CONFIG[$key]:-$default}"
+}
+
+# Load config: global first, then project (project wins)
+load_config() {
+    CONFIG=()
+    SCHEDULE_NAMES=()
+    # global
+    parse_config_file "${HOME}/.leash"
+    # project-local (overrides global for same keys)
+    local git_root
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -n "$git_root" && -f "${git_root}/.leash" ]]; then
+        parse_config_file "${git_root}/.leash"
+    fi
+}
+
+# --- Time & Day Checking -----------------------------------------------------
+
+time_to_minutes() {
+    local t="$1"
+    local h="${t%%:*}"
+    local m="${t##*:}"
+    # strip leading zeros for arithmetic
+    h=$((10#$h))
+    m=$((10#$m))
+    echo $(( h * 60 + m ))
+}
+
+is_in_time_window() {
+    local start_min="$1"
+    local end_min="$2"
+    local now_min="$3"
+
+    if (( start_min <= end_min )); then
+        # normal window: 09:00-17:00
+        (( now_min >= start_min && now_min < end_min ))
+    else
+        # overnight window: 23:00-06:00
+        (( now_min >= start_min || now_min < end_min ))
+    fi
+}
+
+day_matches() {
+    local days_str="$1"
+    local current_day="$2"
+
+    local -a _day_list
+    IFS=',' read -ra _day_list <<< "$days_str"
+    for d in "${_day_list[@]}"; do
+        d="${d#"${d%%[![:space:]]*}"}"
+        d="${d%"${d##*[![:space:]]}"}"
+        d="${d,,}" # lowercase
+        [[ "$d" == "$current_day" ]] && return 0
+    done
+    return 1
+}
+
+# --- Repo Matching ------------------------------------------------------------
+
+get_all_remotes() {
+    git remote -v 2>/dev/null | awk '{print $2}' | sort -u
+}
+
+get_repo_path() {
+    git rev-parse --show-toplevel 2>/dev/null
+}
+
+get_repo_dirname() {
+    local path
+    path="$(get_repo_path)"
+    basename "$path" 2>/dev/null
+}
+
+# Match a single pattern like "remote:github.com/company/*" against repo
+match_repo_pattern() {
+    local pattern="$1"
+    local type="${pattern%%:*}"
+    local glob="${pattern#*:}"
+
+    case "$type" in
+        remote)
+            local remotes
+            remotes="$(get_all_remotes)"
+            while IFS= read -r remote_url; do
+                # strip protocol prefix for matching
+                local stripped="$remote_url"
+                stripped="${stripped#https://}"
+                stripped="${stripped#http://}"
+                stripped="${stripped#git@}"
+                stripped="${stripped#ssh://}"
+                # git@github.com:user/repo.git -> github.com/user/repo.git
+                stripped="${stripped/://}"
+                # strip .git suffix
+                stripped="${stripped%.git}"
+
+                # shellcheck disable=SC2053
+                if [[ "$stripped" == $glob ]]; then
+                    return 0
+                fi
+            done <<< "$remotes"
+            ;;
+        path)
+            local repo_path
+            repo_path="$(get_repo_path)"
+            # shellcheck disable=SC2053
+            [[ "$repo_path" == $glob ]] && return 0
+            ;;
+        dir)
+            local repo_dir
+            repo_dir="$(get_repo_dirname)"
+            # shellcheck disable=SC2053
+            [[ "$repo_dir" == $glob ]] && return 0
+            ;;
+        *)
+            # unknown prefix, no match
+            return 1
+            ;;
+    esac
+    return 1
+}
+
+# Check if repo matches any pattern in a list
+repo_matches_any() {
+    local prefix="$1" # e.g., schedule.work-focus.allow
+    local count
+    count="$(cfg "${prefix}._count" "0")"
+
+    (( count == 0 )) && return 1
+
+    local i
+    for (( i = 0; i < count; i++ )); do
+        local pattern
+        pattern="$(cfg "${prefix}.${i}" "")"
+        [[ -n "$pattern" ]] && match_repo_pattern "$pattern" && return 0
+    done
+    return 1
+}
+
+# --- Warnings -----------------------------------------------------------------
+
+leash_warn_allow_block() {
+    local schedule_name="$1"
+    local suppress
+    suppress="$(cfg "messages.suppress_warnings" "false")"
+    [[ "$suppress" == "true" ]] && return 0
+    echo "  🐾 leash: warning: schedule \"${schedule_name}\" has both allow= and block= lines" >&2
+    echo "     block= lines are ignored when allow= is present" >&2
+    echo "     set suppress_warnings=true in [messages] to silence this" >&2
+}
+
+# --- Core Check Logic ---------------------------------------------------------
+
+# Returns 0 if commit should be blocked, 1 if allowed.
+# Sets BLOCK_SCHEDULE_NAME and BLOCK_SCHEDULE_* vars on block.
+check_should_block() {
+    local tz current_day current_time_str now_min
+
+    for schedule_name in "${SCHEDULE_NAMES[@]:-}"; do
+        local sp="schedule.${schedule_name}."
+
+        # get timezone
+        tz="$(cfg "${sp}timezone" "local")"
+
+        # get current day and time in the right timezone
+        if [[ "$tz" == "local" ]]; then
+            current_day="$(date +%a)"
+            current_time_str="$(date +%H:%M)"
+        else
+            current_day="$(TZ="$tz" date +%a)"
+            current_time_str="$(TZ="$tz" date +%H:%M)"
+        fi
+        current_day="${current_day,,}" # lowercase
+
+        # check day
+        local days
+        days="$(cfg "${sp}days" "mon,tue,wed,thu,fri")"
+        day_matches "$days" "$current_day" || continue
+
+        # check time
+        local start end
+        start="$(cfg "${sp}start" "")"
+        end="$(cfg "${sp}end" "")"
+        [[ -z "$start" || -z "$end" ]] && continue
+
+        local start_min end_min
+        start_min="$(time_to_minutes "$start")"
+        end_min="$(time_to_minutes "$end")"
+        now_min="$(time_to_minutes "$current_time_str")"
+
+        is_in_time_window "$start_min" "$end_min" "$now_min" || continue
+
+        # we're in the time window — check repo filters
+        local has_allow has_block
+        has_allow="$(cfg "${sp}allow._count" "0")"
+        has_block="$(cfg "${sp}block._count" "0")"
+
+        if (( has_allow > 0 )); then
+            # warn if block= lines are being ignored
+            if (( has_block > 0 )); then
+                leash_warn_allow_block "$schedule_name"
+            fi
+            # allow mode: block unless repo matches
+            repo_matches_any "${sp}allow" && continue
+            # repo not in allow list — block
+        elif (( has_block > 0 )); then
+            # block mode: block only if repo matches
+            repo_matches_any "${sp}block" || continue
+            # repo in block list — block
+        fi
+        # else: no filters, block everything in this window
+
+        # blocked!
+        BLOCK_SCHEDULE_NAME="$schedule_name"
+        BLOCK_DAYS="$days"
+        BLOCK_START="$start"
+        BLOCK_END="$end"
+        BLOCK_TZ="$tz"
+        # per-schedule task, fall back to global [task]
+        BLOCK_TASK="$(cfg "${sp}task" "$(cfg "task.current" "")")"
+        return 0
+    done
+
+    return 1
+}
+
+# --- Messages -----------------------------------------------------------------
+
+msg_default() {
+    local task env_var slip_file
+    task="$BLOCK_TASK"
+    env_var="$(cfg "override.env_var" "UNLEASH")"
+    slip_file="$(cfg "override.slip_file" ".leash-slip")"
+
+    echo ""
+    echo "  🐾 leash: focus time is active — schedule \"${BLOCK_SCHEDULE_NAME}\""
+    echo "     ${BLOCK_DAYS} ${BLOCK_START}–${BLOCK_END} (${BLOCK_TZ})"
+    echo ""
+    if [[ -n "$task" ]]; then
+        echo "     you should be working on: ${task}"
+        echo ""
+    fi
+    echo "     override:  ${env_var}=1 git commit ..."
+    echo "     one-time:  touch ${slip_file}"
+    echo "     nuclear:   git commit --no-verify"
+    echo ""
+}
+
+msg_puppy() {
+    local task env_var slip_file
+    task="$BLOCK_TASK"
+    env_var="$(cfg "override.env_var" "UNLEASH")"
+    slip_file="$(cfg "override.slip_file" ".leash-slip")"
+
+    # randomize bark
+    local -a barks=(
+        "arf arf! bad puppy!! no commits during focus time!!"
+        "woof! hey! you're not supposed to be doing that!!"
+        "bork bork! paws OFF the commit button!!"
+        "*tugs leash* nuh uh!! it's focus time!!"
+        "*whimper* you promised you'd focus this time..."
+        "WOOF! sit! stay! no commit!"
+        "*pulls you back by the collar* not so fast!!"
+        "arf! you silly puppy, it's not commit time yet!"
+    )
+    local bark="${barks[$((RANDOM % ${#barks[@]}))]}"
+
+    echo ""
+    echo "  🐾 ${bark}"
+    echo "     schedule \"${BLOCK_SCHEDULE_NAME}\" is active"
+    echo "     ${BLOCK_DAYS} ${BLOCK_START}–${BLOCK_END} (${BLOCK_TZ})"
+    echo ""
+    if [[ -n "$task" ]]; then
+        echo "     be a good girl and work on: ${task} 🐶"
+        echo ""
+    fi
+    echo "     slip the leash:        ${env_var}=1 git commit ..."
+    echo "     one-time walkies pass:  touch ${slip_file}"
+    echo "     ...or --no-verify, but that's cheating and you know it"
+    echo ""
+}
+
+show_block_message() {
+    local tone
+    tone="$(cfg "messages.tone" "default")"
+    case "$tone" in
+        puppy) msg_puppy ;;
+        *)     msg_default ;;
+    esac
+}
+
+# --- Hook Check (called by pre-commit hook) -----------------------------------
+
+do_check() {
+    load_config
+
+    # check overrides first (fast exit)
+    local env_var slip_file
+    env_var="$(cfg "override.env_var" "UNLEASH")"
+    slip_file="$(cfg "override.slip_file" ".leash-slip")"
+
+    # env var override
+    if [[ "${!env_var:-}" == "1" ]]; then
+        return 0
+    fi
+
+    # slip file override (burns on use)
+    local git_root
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    local slip_path="${git_root:-.}/${slip_file}"
+    if [[ -f "$slip_path" ]]; then
+        rm -f "$slip_path"
+        echo "  🐾 leash: slip used — this one's free. don't make a habit of it~"
+        return 0
+    fi
+
+    # no schedules configured = no restrictions
+    (( ${#SCHEDULE_NAMES[@]} == 0 )) && return 0
+
+    if check_should_block; then
+        show_block_message >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# --- Hook Generator -----------------------------------------------------------
+
+generate_hook() {
+    local leash_path="$1"
+    cat << HOOK_EOF
+#!/usr/bin/env bash
+# git-leash pre-commit hook (auto-generated)
+# This hook blocks commits during configured focus windows.
+# Config: ~/.leash (global) and .leash (project-local)
+# Override: set env var (default UNLEASH=1), touch slip file, or --no-verify
+
+__leash_bin="${leash_path}"
+
+# find leash: saved path > PATH > give up (allow commit)
+if [[ -x "\$__leash_bin" ]]; then
+    "\$__leash_bin" check
+elif command -v leash &>/dev/null; then
+    leash check
+else
+    # leash not found — don't block commits, just warn once
+    echo "  🐾 leash: can't find leash script (was at \$__leash_bin)" >&2
+    echo "     commits are unguarded. reinstall with: leash install" >&2
+    exit 0
+fi
+__leash_exit=\$?
+
+# chain: run existing pre-commit hook if it was backed up
+if [[ -x "\$(dirname "\$0")/pre-commit.leash-backup" ]]; then
+    "\$(dirname "\$0")/pre-commit.leash-backup" "\$@"
+    __chain_exit=\$?
+    (( __leash_exit != 0 || __chain_exit != 0 )) && exit 1
+fi
+
+exit \$__leash_exit
+HOOK_EOF
+}
+
+# --- Install / Uninstall ------------------------------------------------------
+
+cmd_install() {
+    local global=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --global) global=1; shift ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    # resolve path to this script
+    local self_path
+    self_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    if (( global )); then
+        local hooks_dir="${HOME}/.leash-hooks"
+        mkdir -p "$hooks_dir"
+        generate_hook "$self_path" > "${hooks_dir}/pre-commit"
+        chmod +x "${hooks_dir}/pre-commit"
+        git config --global core.hooksPath "$hooks_dir"
+        echo "  🐾 leash: installed globally"
+        echo "     hooks path: ${hooks_dir}"
+        echo "     config: ~/.leash"
+        echo ""
+        echo "  tip: create ~/.leash with your schedule (see leash example)"
+        return 0
+    fi
+
+    # local install
+    local git_root
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -z "$git_root" ]]; then
+        echo "error: not in a git repository" >&2
+        return 1
+    fi
+
+    local hooks_dir="${git_root}/.git/hooks"
+    mkdir -p "$hooks_dir"
+
+    # backup existing pre-commit hook
+    if [[ -f "${hooks_dir}/pre-commit" ]]; then
+        # don't back up if it's already a leash hook
+        if ! grep -q "git-leash" "${hooks_dir}/pre-commit" 2>/dev/null; then
+            mv "${hooks_dir}/pre-commit" "${hooks_dir}/pre-commit.leash-backup"
+            echo "  backed up existing pre-commit hook → pre-commit.leash-backup"
+        fi
+    fi
+
+    generate_hook "$self_path" > "${hooks_dir}/pre-commit"
+    chmod +x "${hooks_dir}/pre-commit"
+
+    # stealth: add .leash and .leash-slip to .git/info/exclude
+    local exclude_file="${git_root}/.git/info/exclude"
+    mkdir -p "$(dirname "$exclude_file")"
+    touch "$exclude_file"
+    for pattern in ".leash" ".leash-slip"; do
+        if ! grep -qxF "$pattern" "$exclude_file" 2>/dev/null; then
+            echo "$pattern" >> "$exclude_file"
+        fi
+    done
+
+    echo "  🐾 leash: installed to ${git_root}"
+    echo "     hook: .git/hooks/pre-commit"
+    echo "     .leash and .leash-slip added to .git/info/exclude (stealth mode)"
+    echo ""
+    echo "  tip: create .leash with your schedule (see leash example)"
+
+    # validate config if present
+    load_config
+    for sn in "${SCHEDULE_NAMES[@]:-}"; do
+        local sp="schedule.${sn}."
+        local ac bc
+        ac="$(cfg "${sp}allow._count" "0")"
+        bc="$(cfg "${sp}block._count" "0")"
+        if (( ac > 0 && bc > 0 )); then
+            leash_warn_allow_block "$sn"
+        fi
+    done
+}
+
+cmd_uninstall() {
+    local global=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --global) global=1; shift ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if (( global )); then
+        local hooks_dir="${HOME}/.leash-hooks"
+        rm -f "${hooks_dir}/pre-commit"
+        git config --global --unset core.hooksPath 2>/dev/null || true
+        echo "  🐾 leash: uninstalled globally"
+        return 0
+    fi
+
+    local git_root
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -z "$git_root" ]]; then
+        echo "error: not in a git repository" >&2
+        return 1
+    fi
+
+    local hooks_dir="${git_root}/.git/hooks"
+
+    if [[ -f "${hooks_dir}/pre-commit" ]] && grep -q "git-leash" "${hooks_dir}/pre-commit" 2>/dev/null; then
+        rm -f "${hooks_dir}/pre-commit"
+        # restore backup if exists
+        if [[ -f "${hooks_dir}/pre-commit.leash-backup" ]]; then
+            mv "${hooks_dir}/pre-commit.leash-backup" "${hooks_dir}/pre-commit"
+            echo "  restored previous pre-commit hook from backup"
+        fi
+        echo "  🐾 leash: uninstalled from ${git_root}"
+    else
+        echo "  leash hook not found in this repo"
+    fi
+}
+
+# --- Slip ---------------------------------------------------------------------
+
+cmd_slip() {
+    local git_root slip_file slip_path
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -z "$git_root" ]]; then
+        echo "error: not in a git repository" >&2
+        return 1
+    fi
+
+    load_config
+    slip_file="$(cfg "override.slip_file" ".leash-slip")"
+    slip_path="${git_root}/${slip_file}"
+
+    touch "$slip_path"
+    echo "  🐾 leash: slip created — your next commit gets a free pass"
+    echo "     (${slip_file} will be auto-deleted after one use)"
+}
+
+# --- Status -------------------------------------------------------------------
+
+cmd_status() {
+    load_config
+
+    local git_root
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+    echo ""
+    echo "  🐾 git-leash status"
+    echo "  ─────────────────────"
+    echo ""
+
+    # config sources
+    if [[ -f "${HOME}/.leash" ]]; then
+        echo "  global config:  ~/.leash"
+    else
+        echo "  global config:  (none)"
+    fi
+    if [[ -n "$git_root" && -f "${git_root}/.leash" ]]; then
+        echo "  project config: ${git_root}/.leash"
+    else
+        echo "  project config: (none)"
+    fi
+    echo ""
+
+    # schedules
+    if (( ${#SCHEDULE_NAMES[@]} == 0 )); then
+        echo "  no schedules configured"
+    else
+        for sn in "${SCHEDULE_NAMES[@]}"; do
+            local sp="schedule.${sn}."
+            local days start end tz
+            days="$(cfg "${sp}days" "mon,tue,wed,thu,fri")"
+            start="$(cfg "${sp}start" "?")"
+            end="$(cfg "${sp}end" "?")"
+            tz="$(cfg "${sp}timezone" "local")"
+
+            # check if currently active
+            local active="  "
+            local current_day current_time_str
+            if [[ "$tz" == "local" ]]; then
+                current_day="$(date +%a)"
+                current_time_str="$(date +%H:%M)"
+            else
+                current_day="$(TZ="$tz" date +%a)"
+                current_time_str="$(TZ="$tz" date +%H:%M)"
+            fi
+            current_day="${current_day,,}"
+
+            if day_matches "$days" "$current_day"; then
+                local start_min end_min now_min
+                start_min="$(time_to_minutes "$start")"
+                end_min="$(time_to_minutes "$end")"
+                now_min="$(time_to_minutes "$current_time_str")"
+                if is_in_time_window "$start_min" "$end_min" "$now_min"; then
+                    active="▶ "
+                fi
+            fi
+
+            echo "  ${active}schedule \"${sn}\": ${days} ${start}–${end} (${tz})"
+
+            # show allow/block rules
+            local allow_count block_count
+            allow_count="$(cfg "${sp}allow._count" "0")"
+            block_count="$(cfg "${sp}block._count" "0")"
+            local i
+            for (( i = 0; i < allow_count; i++ )); do
+                echo "     allow: $(cfg "${sp}allow.${i}" "")"
+            done
+            for (( i = 0; i < block_count; i++ )); do
+                echo "     block: $(cfg "${sp}block.${i}" "")"
+            done
+        done
+    fi
+    echo ""
+
+    # task
+    local task
+    task="$(cfg "task.current" "")"
+    if [[ -n "$task" ]]; then
+        echo "  current task: ${task}"
+    else
+        echo "  current task: (none)"
+    fi
+
+    # tone
+    local tone
+    tone="$(cfg "messages.tone" "default")"
+    echo "  message tone: ${tone}"
+
+    # override config
+    local env_var slip_file
+    env_var="$(cfg "override.env_var" "UNLEASH")"
+    slip_file="$(cfg "override.slip_file" ".leash-slip")"
+    echo "  override env:  ${env_var}=1"
+    echo "  slip file:     ${slip_file}"
+
+    # current time
+    echo ""
+    echo "  current time:  $(date '+%a %H:%M %Z')"
+
+    # check if would block right now
+    if (( ${#SCHEDULE_NAMES[@]} > 0 )); then
+        if check_should_block; then
+            echo "  status:        BLOCKED (schedule \"${BLOCK_SCHEDULE_NAME}\")"
+        else
+            echo "  status:        free to commit"
+        fi
+    fi
+    echo ""
+}
+
+# --- Task ---------------------------------------------------------------------
+
+cmd_task() {
+    if [[ $# -eq 0 ]]; then
+        load_config
+        local task
+        task="$(cfg "task.current" "")"
+        if [[ -n "$task" ]]; then
+            echo "  current task: ${task}"
+        else
+            echo "  no task set"
+        fi
+        return 0
+    fi
+
+    local new_task="$*"
+    # find the config file to update (prefer project, fall back to global)
+    local config_file=""
+    local git_root
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+    if [[ -n "$git_root" && -f "${git_root}/.leash" ]]; then
+        config_file="${git_root}/.leash"
+    elif [[ -f "${HOME}/.leash" ]]; then
+        config_file="${HOME}/.leash"
+    elif [[ -n "$git_root" ]]; then
+        config_file="${git_root}/.leash"
+    else
+        config_file="${HOME}/.leash"
+    fi
+
+    # update or add [task] section
+    if [[ -f "$config_file" ]] && grep -q '^\[task\]' "$config_file" 2>/dev/null; then
+        # replace existing current= line
+        if grep -q '^current=' "$config_file" 2>/dev/null; then
+            sed -i "s|^current=.*|current=${new_task}|" "$config_file"
+        else
+            sed -i "/^\[task\]/a current=${new_task}" "$config_file"
+        fi
+    else
+        # append [task] section
+        {
+            echo ""
+            echo "[task]"
+            echo "current=${new_task}"
+        } >> "$config_file"
+    fi
+
+    echo "  🐾 task set: ${new_task}"
+}
+
+# --- Example Config -----------------------------------------------------------
+
+cmd_example() {
+    cat << 'EXAMPLE'
+# git-leash config
+# Place at ~/.leash (global) or .leash in repo root (project-local)
+# Project config overrides global for the same keys.
+#
+# To hide .leash from git without touching .gitignore:
+#   echo ".leash" >> .git/info/exclude
+# (leash install does this automatically)
+
+# --- Schedules ---------------------------------------------------------------
+# Named schedule blocks define when commits are restricted.
+# Multiple schedules stack — if ANY schedule matches, commit is blocked.
+
+[schedule "work-hours"]
+days=mon,tue,wed,thu,fri
+start=09:00
+end=17:00
+timezone=local
+# timezone can be "local" or an IANA zone like "America/New_York"
+
+# Repo filters (optional). Without filters, ALL repos are blocked.
+# Prefix required: remote: path: or dir:
+# Multiple allow/block lines stack as OR (any match = hit)
+
+# allow mode: only matching repos can commit (whitelist)
+#allow=remote:github.com/company/*
+#allow=remote:gitlab.internal/*
+#allow=path:/home/user/work/*
+#allow=dir:work-project
+
+# block mode: only matching repos are blocked (blacklist)
+#block=remote:github.com/personaluser/*
+#block=dir:side-project
+
+# per-schedule task (optional, overrides global [task])
+task=finish the auth refactor
+
+# --- Another schedule example ------------------------------------------------
+#[schedule "go-to-bed"]
+#days=sun,mon,tue,wed,thu
+#start=23:00
+#end=06:00
+#task=go to sleep you disaster
+# overnight windows work too — this blocks 11pm to 6am
+
+# --- Task (optional) ---------------------------------------------------------
+# Global fallback task, shown when a schedule doesn't have its own.
+# Update with: leash task "whatever you should be doing"
+
+[task]
+current=finish the auth refactor
+
+# --- Messages (optional) -----------------------------------------------------
+
+[messages]
+# tone=default    # normal focus-helper vibes
+tone=puppy        # i know what you are
+
+# --- Override (optional) ------------------------------------------------------
+# Configure escape hatches. Defaults shown below.
+
+[override]
+env_var=UNLEASH
+slip_file=.leash-slip
+# Override methods:
+#   UNLEASH=1 git commit ...     (env var bypass)
+#   touch .leash-slip            (one-time pass, auto-deleted after use)
+#   git commit --no-verify       (skips all hooks, always works)
+EXAMPLE
+}
+
+# --- Help ---------------------------------------------------------------------
+
+cmd_help() {
+    cat << 'HELP'
+🐾 git-leash — helps you stay focused on what you're supposed to be doing.
+
+Usage: leash <command> [options]
+
+Commands:
+  install [--global]    Install the pre-commit hook
+  uninstall [--global]  Remove the pre-commit hook
+  slip                  Create a one-time commit pass
+  status                Show current config and block status
+  task [description]    Show or set the current task reminder
+  check                 Run the hook check (used internally)
+  example               Print an example .leash config
+  version               Show version
+  help                  Show this help
+
+Config:
+  ~/.leash              Global config (applies everywhere)
+  .leash                Project-local config (overrides global)
+
+Override a block:
+  UNLEASH=1 git commit  Environment variable bypass
+  leash slip            One-time pass (burns after one commit)
+  git commit --no-verify  Nuclear option (skips all hooks)
+
+Stealth:
+  leash install automatically adds .leash and .leash-slip to
+  .git/info/exclude — no .gitignore modifications needed.
+
+HELP
+}
+
+# --- CLI Dispatch -------------------------------------------------------------
+
+main() {
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        install)    cmd_install "$@" ;;
+        uninstall)  cmd_uninstall "$@" ;;
+        slip)       cmd_slip "$@" ;;
+        status)     cmd_status "$@" ;;
+        task)       cmd_task "$@" ;;
+        check)      do_check "$@" ;;
+        example)    cmd_example ;;
+        version)    echo -e "git-leash ${LEASH_VERSION}\n🔦🐺🪽";;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: $cmd" >&2
+            echo "Run 'leash help' for usage." >&2
+            return 1
+            ;;
+    esac
+}
+
+main "$@"

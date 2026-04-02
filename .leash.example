@@ -1,0 +1,74 @@
+# git-leash config
+# Place at ~/.leash (global) or .leash in repo root (project-local)
+# Project config overrides global for the same keys.
+#
+# To hide .leash from git without touching .gitignore:
+#   echo ".leash" >> .git/info/exclude
+# (leash install does this automatically)
+
+# --- Schedules ---------------------------------------------------------------
+# Named schedule blocks define when commits are restricted.
+# Multiple schedules stack — if ANY schedule matches, commit is blocked.
+
+[schedule "work-hours"]
+days=mon,tue,wed,thu,fri
+start=09:00
+end=17:00
+timezone=local
+# timezone can be "local" or an IANA zone like "America/New_York"
+
+# Repo filters (optional). Without filters, ALL repos are blocked.
+# Prefix required: remote: path: or dir:
+# Multiple allow/block lines stack as OR (any match = hit)
+
+# allow mode: only matching repos can commit (whitelist)
+#allow=remote:github.com/company/*
+#allow=remote:gitlab.internal/*
+allow=path:/home/user/work/*
+#allow=dir:work-project
+
+# block mode: only matching repos are blocked (blacklist)
+#block=remote:github.com/personaluser/*
+#block=dir:side-project
+
+# per-schedule task (optional, overrides global [task])
+task=finish the auth refactor
+
+# --- Another schedule example ------------------------------------------------
+#[schedule "go-to-bed"]
+#days=sun,mon,tue,wed,thu
+#start=23:00
+#end=06:00
+#task=go to sleep you disaster
+# overnight windows work too — this blocks 11pm to 6am
+
+# --- Task (optional) ---------------------------------------------------------
+# Global fallback task, shown when a schedule doesn't have its own.
+# Update with: leash task "whatever you should be doing"
+
+[task]
+current=puppy should be working right now
+
+# --- Messages (optional) -----------------------------------------------------
+
+[messages]
+# tone=default    # normal focus-helper vibes
+tone=puppy        # i know what you are
+
+# --- Another schedule example ------------------------------------------------
+#[schedule "go-to-bed"]
+#days=mon,tue,wed,thu,sun
+#start=23:00
+#end=06:00
+# overnight windows work too — this blocks 11pm to 6am
+
+# --- Override (optional) ------------------------------------------------------
+# Configure escape hatches. Defaults shown below.
+
+[override]
+env_var=UNLEASH
+slip_file=.leash-slip
+# Override methods:
+#   UNLEASH=1 git commit ...     (env var bypass)
+#   touch .leash-slip            (one-time pass, auto-deleted after use)
+#   git commit --no-verify       (skips all hooks, always works)
