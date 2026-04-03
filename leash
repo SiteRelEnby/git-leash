@@ -676,14 +676,16 @@ else
 fi
 __leash_exit=\$?
 
+# if leash blocked, fail fast — don't run backup hook
+(( __leash_exit != 0 )) && exit \$__leash_exit
+
 # chain: run existing pre-commit hook if it was backed up
 if [[ -x "\$(dirname "\$0")/pre-commit.leash-backup" ]]; then
     "\$(dirname "\$0")/pre-commit.leash-backup" "\$@"
-    __chain_exit=\$?
-    (( __leash_exit != 0 || __chain_exit != 0 )) && exit 1
+    exit \$?
 fi
 
-exit \$__leash_exit
+exit 0
 HOOK_EOF
 }
 
@@ -704,7 +706,20 @@ cmd_install() {
 
     if (( global )); then
         local hooks_dir="${HOME}/.leash-hooks"
+        local prev_hooks_path
+        prev_hooks_path="$(git config --global core.hooksPath 2>/dev/null || true)"
+
+        # save previous hooksPath for restore on uninstall
+        local state_file="${HOME}/.leash-hooks/.prev-hooks-path"
         mkdir -p "$hooks_dir"
+
+        if [[ -n "$prev_hooks_path" && "$prev_hooks_path" != "$hooks_dir" ]]; then
+            echo "$prev_hooks_path" > "$state_file"
+            echo "  saved previous core.hooksPath: ${prev_hooks_path}"
+        else
+            rm -f "$state_file"
+        fi
+
         generate_hook "$self_path" > "${hooks_dir}/pre-commit"
         chmod +x "${hooks_dir}/pre-commit"
         git config --global core.hooksPath "$hooks_dir"
@@ -724,7 +739,12 @@ cmd_install() {
         return 1
     fi
 
-    local hooks_dir="${git_root}/.git/hooks"
+    # resolve hooks directory (handles worktrees, custom git-dir, etc.)
+    local hooks_dir
+    hooks_dir="$(git rev-parse --git-path hooks 2>/dev/null)"
+    if [[ -z "$hooks_dir" ]]; then
+        hooks_dir="${git_root}/.git/hooks"
+    fi
     mkdir -p "$hooks_dir"
 
     # backup existing pre-commit hook
@@ -740,7 +760,11 @@ cmd_install() {
     chmod +x "${hooks_dir}/pre-commit"
 
     # stealth: add .leash and .leash-slip to .git/info/exclude
-    local exclude_file="${git_root}/.git/info/exclude"
+    local exclude_file
+    exclude_file="$(git rev-parse --git-path info/exclude 2>/dev/null)"
+    if [[ -z "$exclude_file" ]]; then
+        exclude_file="${git_root}/.git/info/exclude"
+    fi
     mkdir -p "$(dirname "$exclude_file")"
     touch "$exclude_file"
     for pattern in ".leash" ".leash-slip"; do
@@ -750,7 +774,7 @@ cmd_install() {
     done
 
     echo "  🐾 leash: installed to ${git_root}"
-    echo "     hook: .git/hooks/pre-commit"
+    echo "     hook: ${hooks_dir}/pre-commit"
     echo "     .leash and .leash-slip added to .git/info/exclude (stealth mode)"
     echo ""
     echo "  tip: create .leash with your schedule (see leash example)"
@@ -779,8 +803,24 @@ cmd_uninstall() {
 
     if (( global )); then
         local hooks_dir="${HOME}/.leash-hooks"
+        local state_file="${hooks_dir}/.prev-hooks-path"
         rm -f "${hooks_dir}/pre-commit"
-        git config --global --unset core.hooksPath 2>/dev/null || true
+
+        # restore previous hooksPath if we saved one
+        if [[ -f "$state_file" ]]; then
+            local prev_path
+            prev_path="$(cat "$state_file")"
+            rm -f "$state_file"
+            if [[ -n "$prev_path" ]]; then
+                git config --global core.hooksPath "$prev_path"
+                echo "  restored previous core.hooksPath: ${prev_path}"
+            else
+                git config --global --unset core.hooksPath 2>/dev/null || true
+            fi
+        else
+            git config --global --unset core.hooksPath 2>/dev/null || true
+        fi
+
         echo "  🐾 leash: uninstalled globally"
         return 0
     fi
@@ -792,7 +832,11 @@ cmd_uninstall() {
         return 1
     fi
 
-    local hooks_dir="${git_root}/.git/hooks"
+    local hooks_dir
+    hooks_dir="$(git rev-parse --git-path hooks 2>/dev/null)"
+    if [[ -z "$hooks_dir" ]]; then
+        hooks_dir="${git_root}/.git/hooks"
+    fi
 
     if [[ -f "${hooks_dir}/pre-commit" ]] && grep -q "git-leash" "${hooks_dir}/pre-commit" 2>/dev/null; then
         rm -f "${hooks_dir}/pre-commit"
@@ -978,12 +1022,33 @@ cmd_task() {
 
     # update or add [task] section
     if [[ -f "$config_file" ]] && grep -q '^\[task\]' "$config_file" 2>/dev/null; then
-        # replace existing current= line
-        if grep -q '^current=' "$config_file" 2>/dev/null; then
-            sed -i "s|^current=.*|current=${new_task}|" "$config_file"
-        else
-            sed -i "/^\[task\]/a current=${new_task}" "$config_file"
+        # rewrite file, replacing current= in [task] section (pure bash, no sed)
+        local in_task=0 replaced=0 tmpfile
+        tmpfile="$(mktemp)"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^\[task\]$ ]]; then
+                in_task=1
+                echo "$line" >> "$tmpfile"
+            elif [[ "$line" =~ ^\[.*\]$ ]]; then
+                # entering a new section — if we were in [task] and never replaced, add it
+                if (( in_task && !replaced )); then
+                    echo "current=${new_task}" >> "$tmpfile"
+                    replaced=1
+                fi
+                in_task=0
+                echo "$line" >> "$tmpfile"
+            elif (( in_task )) && [[ "$line" =~ ^current= ]]; then
+                echo "current=${new_task}" >> "$tmpfile"
+                replaced=1
+            else
+                echo "$line" >> "$tmpfile"
+            fi
+        done < "$config_file"
+        # if [task] was the last section and we never replaced
+        if (( in_task && !replaced )); then
+            echo "current=${new_task}" >> "$tmpfile"
         fi
+        mv "$tmpfile" "$config_file"
     else
         # append [task] section
         {
