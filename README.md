@@ -56,8 +56,9 @@ task=go to sleep you disaster
 # global fallback when a schedule doesn't have its own
 current=stop getting distracted
 
-[messages]
-tone=puppy
+[defaults]
+tone=puppy,wolf
+noun=girl,puppy
 
 [override]
 env_var=UNLEASH
@@ -97,7 +98,7 @@ block=remote:github.com/myuser/*
 block=dir:side-project
 ```
 
-**Pick one per schedule.** If both `allow=` and `block=` are present, `allow=` wins and `block=` is ignored (leash will warn you about this). Set `suppress_warnings=true` in `[messages]` to silence the warning if you know what you're doing.
+**Pick one per schedule.** If both `allow=` and `block=` are present, `allow=` wins and `block=` is ignored (leash will warn you about this). Set `suppress_warnings=true` in `[defaults]` to silence the warning if you know what you're doing.
 
 **Prefixes (required):**
 | Prefix | Matches against |
@@ -130,13 +131,68 @@ Set the global task from the CLI:
 leash task "finish the auth refactor"
 ```
 
-### Message tone
+### Tones
+
+Tones control the personality of block messages. Set in `[defaults]`:
 
 ```ini
-[messages]
-tone=default   # normal focus-helper vibes
-tone=puppy     # i know what you are
+[defaults]
+tone=puppy          # single tone
+tone=puppy,wolf     # comma-separated — picks randomly per commit
+noun=girl,puppy       # comma-separated — {noun} in messages, picked randomly
 ```
+
+**Built-in tones:**
+
+| Tone | Emoji | Default noun | Vibe |
+|---|---|---|---|
+| `default` | `🐾` | — | Plain, no personality |
+| `puppy` | `🐾` | puppy, girl | arf arf! bad {noun}!! |
+| `wolf` | `🐺` | wolf | *growl* ...you know better than this. |
+| `cat` | `🐱` | kitten, kitty | *knocks your commit off the table* |
+| `bunny` | `🐰` | bunny | *nose twitch* u-um... it's focus time... |
+| `fox` | `🦊` | fox | heh. nice try~ but it's focus time. |
+| `robot` | `🤖` | user | COMMIT REJECTED. FOCUS PROTOCOL ACTIVE. |
+
+### Customizing tones
+
+Override or extend built-in tones with `[tone "name"]` sections. `bark=` lines are **additive** — they add to the built-in barks, not replace them:
+
+```ini
+[tone "puppy"]
+noun=puppy,enby              # override default noun for this tone
+bark=*zooms in circles* NO COMMIT!! FOCUS!!   # added to built-in puppy barks
+```
+
+Create fully custom tones by using any name not in the built-in list:
+
+```ini
+[tone "dragon"]
+noun=dragon
+emoji=🐉
+bark=*breathes fire* no commits, {noun}!!
+bark=*sits on your keyboard* this is part of the hoard now.
+task_line=guard your treasure, {noun}: {task}
+env_label=break the seal:
+slip_label=one dragon scale:
+nuclear_label=by claw and fang:
+```
+
+**Tone field reference:**
+
+| Field | Description | Supports `{noun}`/`{task}` |
+|---|---|---|
+| `bark=` | Block message (additive, multiple allowed) | `{noun}` |
+| `noun=` | Comma-separated nouns for this tone | — |
+| `emoji=` | Emoji prefix for block message | — |
+| `task_line=` | Task reminder line | `{noun}`, `{task}` |
+| `env_label=` | Label for env var override hint | — |
+| `slip_label=` | Label for slip file hint | — |
+| `nuclear_label=` | Label for --no-verify hint | — |
+
+**Resolution order:** `[tone "x"]` in project config → `[tone "x"]` in global config → `[defaults]` → built-in defaults.
+
+`noun=` in `[defaults]` applies to **all** tones. `noun=` in a `[tone]` section only applies to that tone.
 
 ## Overrides
 
@@ -183,7 +239,7 @@ The hook remembers where `leash` was installed from, but also checks `PATH` as a
 The whole point is that this doesn't leave traces in your repo:
 
 - `.leash` and `.leash-slip` are added to `.git/info/exclude` (repo-local gitignore, untracked)
-- The hook lives in `.git/hooks/` (not tracked)
+- The hook lives in your git hooks directory (not tracked)
 - Nothing touches `.gitignore`
 
 If there's an existing pre-commit hook, it gets backed up to `pre-commit.leash-backup` and chained — leash runs first, then your original hook.

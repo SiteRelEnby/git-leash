@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-LEASH_VERSION="0.1.1"
+LEASH_VERSION="0.1.2"
 
 # --- Config Parser -----------------------------------------------------------
 # Parses INI-style config with named sections and multi-value keys.
@@ -554,7 +554,7 @@ msg_default_tone() {
         echo ""
     fi
     printf "     %-20s %s=1 git commit ...\n" "override:" "$env_var"
-    printf "     %-20s touch %s\n" "one-time:" "$slip_file"
+    printf "     %-20s leash slip (or touch %s)\n" "one-time:" "$slip_file"
     printf "     %-20s git commit --no-verify\n" "nuclear:"
     echo ""
 }
@@ -604,7 +604,7 @@ show_block_message() {
         echo ""
     fi
     printf "     %-20s %s=1 git commit ...\n" "$env_label" "$env_var"
-    printf "     %-20s touch %s\n" "$slip_label" "$slip_file"
+    printf "     %-20s leash slip (or touch %s)\n" "$slip_label" "$slip_file"
     # if nuclear label is short, use it as a prefix; if long, it's standalone
     if (( ${#nuclear_label} <= 20 )); then
         printf "     %-20s git commit --no-verify\n" "$nuclear_label"
@@ -1154,7 +1154,7 @@ env_var=UNLEASH
 slip_file=.leash-slip
 # Override methods:
 #   UNLEASH=1 git commit ...     (env var bypass)
-#   touch .leash-slip            (one-time pass, auto-deleted after use)
+#   leash slip / touch .leash-slip  (one-time pass, auto-deleted after use)
 #   git commit --no-verify       (skips all hooks, always works)
 EXAMPLE
 }
