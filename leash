@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-LEASH_VERSION="0.1.2"
+LEASH_VERSION="0.1.3"
 
 if ((BASH_VERSINFO < 4)); then
     echo "git-leash requires Bash 4+. Currently running ${BASH_VERSION}"
