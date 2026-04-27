@@ -1,0 +1,9 @@
+-   id: leash
+    name: git-leash
+    description: Block commits based on configurable time windows. Helps you stay focused on what you're supposed to be doing. Overridable when you genuinely need to ship.
+    entry: leash check
+    language: unsupported_script
+    always_run: true
+    pass_filenames: false
+    require_serial: true
+    stages: [pre-commit]

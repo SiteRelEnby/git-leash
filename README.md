@@ -29,6 +29,19 @@ leash install --global
 
 `leash install` automatically adds `.leash` and `.leash-slip` to `.git/info/exclude` — no `.gitignore` modifications, nothing tracked, pure stealth.
 
+## Install with [pre-commit](https://pre-commit.com)
+
+If you're already using https://pre-commit.com, you can add this hook to your repository's `.pre-commit-config.yaml` file.
+The existence won't be stealthy in that case, as `.pre-commit-config.yaml` is normally committed to the repo.
+
+```yaml
+repos:
+- repo: https://github.com/SiteRelEnby/git-leash
+  rev: v0.1.3  # see https://github.com/SiteRelEnby/git-leash/releases
+  hooks:
+  -   id: leash
+```
+
 ## Config
 
 Place at `~/.leash` (global) or `.leash` in your repo root (project-local overrides global).
